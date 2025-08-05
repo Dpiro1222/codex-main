@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS workers;
+DROP TABLE IF EXISTS tips;
+
+CREATE TABLE workers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE tips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    message TEXT,
+    time TEXT NOT NULL,
+    FOREIGN KEY(worker_id) REFERENCES workers(id)
+);
