@@ -6,9 +6,9 @@ AIビジネス系の最新情報を自動収集し、X（旧Twitter）の投稿�
 
 | ステップ | 処理内容 | 使用API |
 |---|---|---|
-| STEP 1 | 最新AIビジネスニュースを5件収集 | Perplexity (`sonar-pro`) |
-| STEP 2 | 各ネタを10点満点でスコアリング（7点以上のみ通過） | Claude (`claude-sonnet-4-6`) |
-| STEP 3 | 通過ネタごとに3パターンの投稿案を生成（各140文字以内） | Claude (`claude-sonnet-4-6`) |
+| STEP 1 | 過去24時間のAIビジネスニュースを5件収集（引用元に無いURLは除外、Notion保存済みのネタはスキップ） | Perplexity (`sonar-pro`) |
+| STEP 2 | 3軸（バズ・社長の自分ごと度・発信者との必然性）で採点し、平均7点以上のみ通過 | Claude (`claude-sonnet-4-6`) |
+| STEP 3 | `best_posts.txt` のお手本を参考に3パターンの投稿案を生成（140文字超過は1回だけ自動短縮） | Claude (`claude-sonnet-4-6`) |
 | STEP 4 | 結果をNotionデータベースに保存 | Notion API |
 
 ---
@@ -80,6 +80,10 @@ https://www.notion.so/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...
 
 作成後、データベースの「共有」からインテグレーションを招待してください。
 
+### 5. お手本の投稿を登録（推奨）
+
+`best_posts.txt` に、自分のXで反応が良かった過去投稿を3〜5本貼ります（`---` の行で区切る）。口調と構成を真似た投稿案が出るようになります。空のままでも動きます。
+
 ---
 
 ## 実行方法
@@ -89,6 +93,10 @@ python main.py
 ```
 
 これだけでSTEP 1〜4が順に実行されます。
+
+### 毎朝の自動実行（GitHub Actions）
+
+`.github/workflows/daily.yml` が毎朝7:00（日本時間）に実行します。リポジトリの Settings → Secrets and variables → Actions に、`.env` と同じ4つのキーを登録してください。Actions タブの「Run workflow」から手動実行もできます。
 
 ### 実行例（ターミナル出力）
 
@@ -137,7 +145,9 @@ python main.py
 |---|---|---|
 | A | ノウハウ暴露型 | 具体的なtipsや方法論を明かす |
 | B | 業界批評型 | 業界の問題点や非常識を指摘する |
-| C | 数字報告型 | 数字や実績を使って説得力を出す |
+| C | 数字報告型 | ネタ内の数字を主役にし、中小企業にとっての意味を言い切る |
+
+数字はネタに書かれているものだけを使います。自社の実績を入れたい箇所は `【自社数値】` と空欄で出るので、投稿前に自分で埋めてください。
 
 発信者ペルソナ: **AIエージェント会社CEO × LINEマーケ専門 × 「AI経営便り」運営**
 
@@ -149,6 +159,8 @@ python main.py
 codex-main/
 ├── main.py          # メインスクリプト（これを実行するだけ）
 ├── requirements.txt # Python依存パッケージ
+├── best_posts.txt   # 投稿案のお手本（自分の伸びた過去投稿）
+├── .github/workflows/daily.yml # 毎朝7:00 JSTの自動実行
 ├── .env             # 環境変数（要作成、Gitにコミット禁止）
 ├── .env.example     # 環境変数テンプレート
 ├── README.md        # このファイル

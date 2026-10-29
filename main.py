@@ -15,6 +15,15 @@ PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
+SCORE_THRESHOLD = 7.0
+MAX_POST_CHARS = 140
+BEST_POSTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_posts.txt")
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_API_KEY}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,6 +35,20 @@ def parse_json(text: str) -> dict:
     if not match:
         raise ValueError(f"JSON not found in response:\n{text[:300]}")
     return json.loads(match.group())
+
+
+def normalize_url(url: str) -> str:
+    return url.strip().rstrip("/").lower()
+
+
+def load_best_posts() -> str:
+    """Load the author's best past posts (separated by ---, # lines are comments)."""
+    if not os.path.exists(BEST_POSTS_FILE):
+        return ""
+    with open(BEST_POSTS_FILE, encoding="utf-8") as f:
+        lines = [line for line in f.read().splitlines() if not line.lstrip().startswith("#")]
+    posts = [p.strip() for p in "\n".join(lines).split("---") if p.strip()]
+    return "\n\n".join(f"例{i}:\n{p}" for i, p in enumerate(posts, 1))
 
 
 def print_section(icon: str, title: str) -> None:
@@ -56,7 +79,8 @@ def gather_news() -> list[dict]:
     prompt = (
         "以下のテーマで過去24時間の最新情報を5件収集。\n"
         "テーマ：AIエージェント/AI自動化、LINEマーケティング、中小企業DX、経営者の課題\n"
-        "各件：タイトル・URL・3行要約・Xで使えるポイントをJSON形式で返すこと\n\n"
+        "各件：タイトル・URL・3行要約・Xで使えるポイントをJSON形式で返すこと\n"
+        "URLは実際に参照した記事のものだけを使い、推測で作らないこと。要約には記事中の数字をそのまま残すこと\n\n"
         "以下のJSON形式のみで返すこと（他のテキスト一切不要）:\n"
         '{"items": [{"title": "...", "url": "https://...", "summary": "...", "x_points": "..."}]}'
     )
@@ -68,6 +92,7 @@ def gather_news() -> list[dict]:
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
+        "search_recency_filter": "day",
     }
 
     try:
@@ -78,7 +103,8 @@ def gather_news() -> list[dict]:
             timeout=60,
         )
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        body = resp.json()
+        content = body["choices"][0]["message"]["content"]
         data = parse_json(content)
         items = data.get("items", [])
     except requests.RequestException as exc:
@@ -88,11 +114,51 @@ def gather_news() -> list[dict]:
         print(f"❌ レスポンス解析エラー: {exc}")
         sys.exit(1)
 
+    # Keep only URLs that Perplexity actually cited; the model may invent the rest.
+    cited = {normalize_url(u) for u in body.get("citations", []) if isinstance(u, str)}
+    cited |= {
+        normalize_url(r["url"]) for r in body.get("search_results", [])
+        if isinstance(r, dict) and r.get("url")
+    }
+    if cited:
+        for item in items:
+            url = item.get("url") or ""
+            if url and normalize_url(url) not in cited:
+                print(f"   ⚠️  引用元に無いURLを除外: {url[:60]}")
+                item["url"] = ""
+
     print(f"✅ {len(items)} 件の情報を収集しました")
     for idx, item in enumerate(items, 1):
         print(f"   {idx}. {item.get('title', '(タイトルなし)')[:60]}")
 
     return items
+
+
+def remove_duplicates(items: list[dict]) -> list[dict]:
+    """Skip items whose URL is already saved in the Notion database."""
+    fresh = []
+    for item in items:
+        url = item.get("url")
+        if not url:
+            fresh.append(item)
+            continue
+        try:
+            resp = requests.post(
+                f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+                headers=NOTION_HEADERS,
+                json={"filter": {"property": "ネタ元URL", "url": {"equals": url}}, "page_size": 1},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            exists = bool(resp.json().get("results"))
+        except requests.RequestException as exc:
+            print(f"   ⚠️  重複チェック失敗（そのまま続行）: {exc}")
+            exists = False
+        if exists:
+            print(f"   ⏭️  保存済みのためスキップ: {item.get('title', '')[:45]}")
+        else:
+            fresh.append(item)
+    return fresh
 
 
 # ---------------------------------------------------------------------------
@@ -115,22 +181,25 @@ def score_items(items: list[dict]) -> list[dict]:
             f"URL: {item.get('url', '')}\n"
             f"要約: {item.get('summary', '')}\n"
             f"Xポイント: {item.get('x_points', '')}\n\n"
-            "採点基準（各1〜10点、平均を出すこと）:\n"
-            "1. バズ可能性（驚き・共感・怒り度）\n"
-            "2. 経営者・起業家への刺さり度\n"
-            "3. AIエージェント会社CEO × LINEマーケ専門家との親和性\n\n"
+            "採点基準（各1〜10点の整数）:\n"
+            "1. buzz: バズ可能性（驚き・共感・反論したくなる度）\n"
+            "2. exec: 従業員10〜50名の中小企業の社長が「自分ごと」と感じる度\n"
+            "3. fit: AIエージェント会社CEO × LINEマーケ専門家が語る必然性\n\n"
+            "目安: 5点=よくある話題、7点=明日の経営判断に効く具体性がある、"
+            "9点以上=業界の常識が変わるレベル。迷ったら低い方を付けること。\n\n"
             "以下のJSON形式のみで返すこと:\n"
-            '{"score": <平均点(小数点1位)>, "reason": "採点理由を1〜2文で"}'
+            '{"buzz": <1-10>, "exec": <1-10>, "fit": <1-10>, "reason": "採点理由を1〜2文で"}'
         )
 
         try:
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=200,
+                max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
             data = parse_json(resp.content[0].text)
-            score = float(data.get("score", 0))
+            axes = [float(data[k]) for k in ("buzz", "exec", "fit")]
+            score = round(sum(axes) / len(axes), 1)
             reason = data.get("reason", "")
         except Exception as exc:
             print(f"      ⚠️  スコアリングスキップ: {exc}")
@@ -138,13 +207,13 @@ def score_items(items: list[dict]) -> list[dict]:
 
         item["score"] = score
         item["score_reason"] = reason
-        badge = "✅ 通過" if score >= 7.0 else "❌ スキップ"
+        badge = "✅ 通過" if score >= SCORE_THRESHOLD else "❌ スキップ"
         print(f"      スコア: {score}/10  {badge}  — {reason[:60]}")
 
-        if score >= 7.0:
+        if score >= SCORE_THRESHOLD:
             passing.append(item)
 
-    print(f"\n   📊 {len(items)} 件中 {len(passing)} 件が7点以上で通過")
+    print(f"\n   📊 {len(items)} 件中 {len(passing)} 件が{SCORE_THRESHOLD:g}点以上で通過")
     return passing
 
 
@@ -152,54 +221,100 @@ def score_items(items: list[dict]) -> list[dict]:
 # STEP 3: Claude — post generation
 # ---------------------------------------------------------------------------
 
+POST_KEYS = [("A", "pattern_a"), ("B", "pattern_b"), ("C", "pattern_c")]
+
+
+def build_post_prompt(item: dict, best_posts: str) -> str:
+    examples = best_posts or "（未設定。best_posts.txt に伸びた過去投稿を入れると精度が上がります）"
+    return (
+        "あなたは「AI経営便り」を運営するAIエージェント会社CEO（LINEマーケ専門）としてXに投稿します。\n\n"
+        "# 読者\n"
+        "従業員10〜50名の中小企業の社長。人手不足と集客に悩み、AIに興味はあるが「何からやればいいか」が分からない。\n\n"
+        "# ネタ\n"
+        f"タイトル: {item.get('title', '')}\n"
+        f"要約: {item.get('summary', '')}\n"
+        f"Xポイント: {item.get('x_points', '')}\n\n"
+        "# お手本（発信者本人の伸びた過去投稿。口調と構成を真似る。内容は真似ない）\n"
+        f"{examples}\n\n"
+        "# 3つの型\n"
+        "A ノウハウ暴露型: 「明日からできる手順3つ」のように具体的なやり方を箇条書きで。保存されることを狙う。\n"
+        "B 業界批評型: 「みんなやっているが実は損をしていること」を指摘し、自分の立場をはっきり示す。"
+        "リプライで議論が起きることを狙う。特定の個人や会社は攻撃しない。\n"
+        "C 数字報告型: ネタの中の数字を主役にし、「その数字が中小企業にとって何を意味するか」を一言で言い切る。\n\n"
+        "# 書き方のルール\n"
+        "- 1行目は次のどれかで始める: 意外な事実 / やらないと損すること / 常識の否定 / 固有名詞＋数字\n"
+        "- 必ず「だから中小企業はこうする」という具体的な一手を入れる\n"
+        "- 締めは、答えやすい二択の問いかけ、または保存を促す一言\n"
+        "- 数字はネタに書かれているものだけ使う。自社の実績を入れたい場所は【自社数値】と書いて空欄にする\n"
+        f"- {MAX_POST_CHARS}文字以内。ハッシュタグとURLは入れない。改行で読みやすくする\n"
+        "- 「いかがでしょうか」「注目です」などの定型句は使わない\n\n"
+        "# 手順\n"
+        "各型で2案ずつ書き、読者が「自分のことだ」と感じる度合いが高い方を各型1案選んで返す。\n\n"
+        "# 出力（JSONのみ）\n"
+        '{"pattern_a": "...", "pattern_b": "...", "pattern_c": "...", '
+        '"hook_a": "使った1行目の型", "hook_b": "...", "hook_c": "..."}'
+    )
+
+
+def shorten_posts(client: anthropic.Anthropic, item: dict) -> None:
+    """Ask Claude once to shorten any pattern that exceeds the character limit."""
+    over = {key: item[key] for _, key in POST_KEYS if len(item[key]) > MAX_POST_CHARS}
+    if not over:
+        return
+    prompt = (
+        f"以下のX投稿を、意味と1行目のフックを保ったまま各{MAX_POST_CHARS}文字以内に短くしてください。\n"
+        "数字や【自社数値】はそのまま残すこと。\n\n"
+        f"{json.dumps(over, ensure_ascii=False)}\n\n"
+        "同じキーのJSONのみで返すこと。"
+    )
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        data = parse_json(resp.content[0].text)
+    except Exception as exc:
+        print(f"      ⚠️  短縮スキップ: {exc}")
+        return
+    for key in over:
+        if data.get(key):
+            item[key] = data[key]
+
+
 def generate_posts(items: list[dict]) -> list[dict]:
     print_section("✍️ ", "STEP 3: Claudeで投稿文を生成中...")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    best_posts = load_best_posts()
+    if not best_posts:
+        print("   ⚠️  best_posts.txt にお手本がありません（汎用の文体で生成します）")
     results = []
 
     for idx, item in enumerate(items, 1):
         title_short = item.get("title", "")[:45]
         print(f"   [{idx}/{len(items)}] {title_short}...")
 
-        prompt = (
-            "以下のネタについてX（旧Twitter）の投稿文を3パターン生成してください。\n\n"
-            f"タイトル: {item.get('title', '')}\n"
-            f"要約: {item.get('summary', '')}\n"
-            f"Xポイント: {item.get('x_points', '')}\n\n"
-            "発信者プロフィール: AIエージェント会社CEO、LINEマーケ専門、「AI経営便り」運営\n\n"
-            "制約（全パターン共通）:\n"
-            "- 140文字以内（厳守）\n"
-            "- 1行目は数字か問いかけで始める\n"
-            "- 最後は問いかけかCTA（行動喚起）で締める\n"
-            "- 経営者・起業家向けの言葉遣い\n"
-            "- ハッシュタグは最大2個\n\n"
-            "パターン定義:\n"
-            "A（ノウハウ暴露型）: 具体的なtipsや方法論を明かす\n"
-            "B（業界批評型）: 業界の問題点や非常識を指摘する\n"
-            "C（数字報告型）: 数字や実績を使って説得力を出す\n\n"
-            "以下のJSON形式のみで返すこと:\n"
-            '{"pattern_a": "...", "pattern_b": "...", "pattern_c": "..."}'
-        )
-
         try:
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=800,
-                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500,
+                messages=[{"role": "user", "content": build_post_prompt(item, best_posts)}],
             )
             data = parse_json(resp.content[0].text)
-            item["pattern_a"] = data.get("pattern_a", "")
-            item["pattern_b"] = data.get("pattern_b", "")
-            item["pattern_c"] = data.get("pattern_c", "")
+            for label, key in POST_KEYS:
+                item[key] = data.get(key, "")
+                item[f"hook_{label.lower()}"] = data.get(f"hook_{label.lower()}", "")
         except Exception as exc:
             print(f"      ⚠️  生成スキップ: {exc}")
             continue
 
-        for label, key in [("A", "pattern_a"), ("B", "pattern_b"), ("C", "pattern_c")]:
+        shorten_posts(client, item)
+
+        for label, key in POST_KEYS:
             count = len(item[key])
-            flag = "✅" if count <= 140 else "⚠️ 超過"
-            print(f"      パターン{label}: {count}文字 {flag}")
+            flag = "✅" if count <= MAX_POST_CHARS else "⚠️ 超過"
+            print(f"      パターン{label}: {count}文字 {flag}  フック: {item[f'hook_{label.lower()}']}")
 
         results.append(item)
 
@@ -213,11 +328,6 @@ def generate_posts(items: list[dict]) -> list[dict]:
 def save_to_notion(items: list[dict]) -> int:
     print_section("📝", "STEP 4: Notionに保存中...")
 
-    headers = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
-    }
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     saved = 0
 
@@ -251,7 +361,7 @@ def save_to_notion(items: list[dict]) -> int:
         try:
             resp = requests.post(
                 "https://api.notion.com/v1/pages",
-                headers=headers,
+                headers=NOTION_HEADERS,
                 json=payload,
                 timeout=30,
             )
@@ -313,6 +423,11 @@ def main() -> None:
     if not all_items:
         print("❌ 情報が取得できませんでした。終了します。")
         sys.exit(1)
+
+    all_items = remove_duplicates(all_items)
+    if not all_items:
+        print("\n⚠️  新しいネタがありませんでした（すべて保存済み）。終了します。")
+        sys.exit(0)
 
     # STEP 2
     scored_items = score_items(all_items)

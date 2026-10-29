@@ -20,6 +20,8 @@ This file provides guidance to AI assistants (Claude, etc.) working with this co
 codex-main/
 ├── main.py              # Single entry point — runs all 4 steps end-to-end
 ├── requirements.txt     # Python dependencies
+├── best_posts.txt       # Few-shot examples of the author's best posts
+├── .github/workflows/daily.yml  # Daily run at 7:00 JST
 ├── .env                 # Secret keys (never commit)
 ├── .env.example         # Template for .env (safe to commit)
 ├── README.md            # Setup and usage guide
@@ -50,12 +52,14 @@ Never hardcode these. Always call `load_dotenv()` at the top of `main.py`.
 - Endpoint: `https://api.perplexity.ai/chat/completions`
 - Collects 5 items about: AIエージェント/AI自動化, LINEマーケティング, 中小企業DX, 経営者の課題
 - Response parsed as JSON: `{ items: [ { title, url, summary, x_points } ] }`
+- `search_recency_filter: "day"`; item URLs not in the response's `citations` / `search_results` are blanked
+- `remove_duplicates()` skips items whose URL already exists in the Notion database
 
 ### STEP 2 — Claude (Scoring)
 - Model: `claude-sonnet-4-6`
-- Scores each item 1–10 on three axes: buzz potential, relevance to executives, fit with persona
-- Items with average score **< 7 are discarded**
-- Response parsed as JSON: `{ score: float, reason: str }`
+- Scores each item 1–10 on three axes: `buzz`, `exec` (relevance to SMB presidents), `fit` (fit with persona)
+- The average is computed in code (not by the model); items with average **< 7 (`SCORE_THRESHOLD`) are discarded**
+- Response parsed as JSON: `{ buzz: int, exec: int, fit: int, reason: str }`
 
 ### STEP 3 — Claude (Post Generation)
 - Model: `claude-sonnet-4-6`
@@ -63,8 +67,10 @@ Never hardcode these. Always call `load_dotenv()` at the top of `main.py`.
   - **Pattern A**: ノウハウ暴露型 (Know-how reveal)
   - **Pattern B**: 業界批評型 (Industry criticism)
   - **Pattern C**: 数字報告型 (Numbers/data-driven)
-- Hard constraint: each post must be **≤ 140 characters**
-- Response parsed as JSON: `{ pattern_a, pattern_b, pattern_c }`
+- Hard constraint: each post must be **≤ 140 characters** (`MAX_POST_CHARS`); over-limit posts get one shortening retry
+- Few-shot examples come from `best_posts.txt` (posts separated by `---`, `#` lines ignored)
+- Numbers must come from the source item only; the author's own results are left as `【自社数値】`
+- Response parsed as JSON: `{ pattern_a, pattern_b, pattern_c, hook_a, hook_b, hook_c }`
 
 ### STEP 4 — Notion (Save)
 - Notion API version: `2022-06-28`
